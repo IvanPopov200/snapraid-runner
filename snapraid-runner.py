@@ -15,6 +15,7 @@ from io import StringIO
 # Global variables
 config = None
 email_log = None
+telegram_log = None
 
 
 def tee_log(infile, out_lines, log_level):
@@ -81,16 +82,8 @@ def send_email(success):
     else:
         body = "Error during SnapRAID job:\n\n\n"
 
-    log = email_log.getvalue()
     maxsize = config['email'].get('maxsize', 500) * 1024
-    if maxsize and len(log) > maxsize:
-        cut_lines = log.count("\n", maxsize // 2, -maxsize // 2)
-        log = (
-            "NOTE: Log was too big for email and was shortened\n\n" +
-            log[:maxsize // 2] +
-            "[...]\n\n\n --- LOG WAS TOO BIG - {} LINES REMOVED --\n\n\n[...]".format(
-                cut_lines) +
-            log[-maxsize // 2:])
+    log = shorten_log(email_log.getvalue(), maxsize, "email")
     body += log
 
     msg = MIMEText(body, "plain", "utf-8")
@@ -116,12 +109,120 @@ def send_email(success):
     server.quit()
 
 
+def shorten_log(log, maxsize, target):
+    if maxsize and len(log) > maxsize:
+        cut_lines = log.count("\n", maxsize // 2, -maxsize // 2)
+        return (
+            "NOTE: Log was too big for {} and was shortened\n\n".format(
+                target) +
+            log[:maxsize // 2] +
+            "[...]\n\n\n --- LOG WAS TOO BIG - {} LINES REMOVED --\n\n\n[...]".format(
+                cut_lines) +
+            log[-maxsize // 2:])
+    return log
+
+
+def shorten_message_text(text, maxsize, target):
+    if maxsize <= 0:
+        return ""
+    if len(text) <= maxsize:
+        return text
+
+    note = "NOTE: Log was too big for {} and was shortened\n\n".format(target)
+    marker = "\n[...]\n\n--- LOG WAS TOO BIG AND WAS SHORTENED --\n\n[...]\n"
+    overhead = len(note) + len(marker)
+    if overhead >= maxsize:
+        return text[:maxsize]
+
+    keep = maxsize - overhead
+    start = keep // 2
+    end = keep - start
+    return note + text[:start] + marker + text[-end:]
+
+
+def send_telegram(success):
+    import json
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    if len(config["telegram"]["bot_token"]) == 0:
+        logging.error("Failed to send Telegram because bot token is not set")
+        return
+    if len(config["telegram"]["chat_id"]) == 0:
+        logging.error("Failed to send Telegram because chat id is not set")
+        return
+
+    if success:
+        body = "SnapRAID job completed successfully:\n\n\n"
+    else:
+        body = "Error during SnapRAID job:\n\n\n"
+
+    # Telegram Bot API sendMessage currently accepts 4096 characters.
+    max_message_size = 4096
+    configured_maxsize = config["telegram"].get("maxsize", 0) * 1024
+    if configured_maxsize > 0:
+        max_message_size = min(max_message_size, configured_maxsize)
+
+    log = telegram_log.getvalue()
+    log_maxsize = max_message_size - len(body)
+    body += shorten_message_text(log, log_maxsize, "Telegram")
+    if len(body) > max_message_size:
+        body = body[:max_message_size]
+
+    bot_token = urllib.parse.quote(config["telegram"]["bot_token"], safe=":")
+    url = "https://api.telegram.org/bot{}/sendMessage".format(bot_token)
+    data = {
+        "chat_id": config["telegram"]["chat_id"],
+        "text": body,
+    }
+    if config["telegram"]["disable_notification"]:
+        data["disable_notification"] = "true"
+    request = urllib.request.Request(
+        url,
+        data=urllib.parse.urlencode(data).encode("utf-8"),
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "snapraid-runner",
+        })
+
+    timeout = config["telegram"].get("timeout", 0)
+    if timeout <= 0:
+        timeout = 30
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response_body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        response_body = e.read().decode("utf-8", errors="replace")
+        try:
+            error = json.loads(response_body).get("description")
+        except ValueError:
+            error = response_body
+        raise RuntimeError(
+            "Telegram Bot API request failed: HTTP {} {}".format(
+                e.code, error)) from e
+
+    try:
+        result = json.loads(response_body)
+    except ValueError as e:
+        raise RuntimeError("Telegram Bot API returned invalid JSON") from e
+    if not result.get("ok"):
+        raise RuntimeError(
+            "Telegram Bot API returned an error: {}".format(
+                result.get("description", "unknown error")))
+
+
 def finish(is_success):
     if ("error", "success")[is_success] in config["email"]["sendon"]:
         try:
             send_email(is_success)
         except Exception:
             logging.exception("Failed to send email")
+    if ("error", "success")[is_success] in config["telegram"]["sendon"]:
+        try:
+            send_telegram(is_success)
+        except Exception:
+            logging.exception("Failed to send Telegram")
     if is_success:
         logging.info("Run finished successfully")
     else:
@@ -133,7 +234,7 @@ def load_config(args):
     global config
     parser = configparser.RawConfigParser()
     parser.read(args.conf)
-    sections = ["snapraid", "logging", "email", "smtp", "scrub"]
+    sections = ["snapraid", "logging", "email", "smtp", "telegram", "scrub"]
     config = dict((x, defaultdict(lambda: "")) for x in sections)
     for section in parser.sections():
         for (k, v) in parser.items(section):
@@ -142,6 +243,7 @@ def load_config(args):
     int_options = [
         ("snapraid", "deletethreshold"), ("logging", "maxsize"),
         ("scrub", "older-than"), ("email", "maxsize"),
+        ("telegram", "maxsize"), ("telegram", "timeout"),
     ]
     for section, option in int_options:
         try:
@@ -153,6 +255,10 @@ def load_config(args):
     config["smtp"]["tls"] = (config["smtp"]["tls"].lower() == "true")
     config["scrub"]["enabled"] = (config["scrub"]["enabled"].lower() == "true")
     config["email"]["short"] = (config["email"]["short"].lower() == "true")
+    config["telegram"]["short"] = (
+        config["telegram"]["short"].lower() == "true")
+    config["telegram"]["disable_notification"] = (
+        config["telegram"]["disable_notification"].lower() == "true")
     config["snapraid"]["touch"] = (config["snapraid"]["touch"].lower() == "true")
 
     # Migration
@@ -194,9 +300,19 @@ def setup_logger():
         email_logger = logging.StreamHandler(email_log)
         email_logger.setFormatter(log_format)
         if config["email"]["short"]:
-            # Don't send programm stdout in email
+            # Don't send program stdout in email
             email_logger.setLevel(logging.INFO)
         root_logger.addHandler(email_logger)
+
+    if config["telegram"]["sendon"]:
+        global telegram_log
+        telegram_log = StringIO()
+        telegram_logger = logging.StreamHandler(telegram_log)
+        telegram_logger.setFormatter(log_format)
+        if config["telegram"]["short"]:
+            # Don't send program stdout in Telegram
+            telegram_logger.setLevel(logging.INFO)
+        root_logger.addHandler(telegram_logger)
 
 
 def main():
