@@ -17,7 +17,7 @@ maxsize = 5000
 [email]
 ; when to send an email, comma-separated list of [success, error]
 sendon = success,error
-; set to false to get full programm output via email
+; set to false to get full program output via email
 short = true
 subject = [SnapRAID] Status Report:
 from =
@@ -34,6 +34,22 @@ ssl = false
 tls = false
 user =
 password =
+
+[telegram]
+; when to send a Telegram notification, comma-separated list of [success, error]
+sendon =
+; bot token from @BotFather
+bot_token =
+; numeric chat ID or channel username, e.g. @channelusername
+chat_id =
+; set to false to get full program output via Telegram
+short = true
+; maximum Telegram message size in KiB, capped by Telegram at 4096 characters
+maxsize = 4
+; set to "true" to send messages silently
+disable_notification = false
+; request timeout in seconds
+timeout = 30
 
 [scrub]
 ; set to true to run scrub after sync
